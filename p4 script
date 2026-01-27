@@ -1,53 +1,56 @@
-#!/bin/bash
+#!/bin/tcsh
 
 echo "========== P4 Safe Sync Script =========="
 
 # ------------------------------------
 # 1. Check for opened / unshelved files
 # ------------------------------------
-OPENED=$(p4 opened 2>/dev/null)
+set OPENED = "`p4 opened 2>/dev/null`"
 
-if [ -n "$OPENED" ]; then
+if ("$OPENED" != "") then
     echo "⚠️ Opened / unshelved files detected:"
     echo "$OPENED"
 
-    read -p "Do you want to revert ALL opened files? (y/n): " rev_ans
-    if [[ "$rev_ans" == "y" ]]; then
+    echo -n "Do you want to revert ALL opened files? (y/n): "
+    set rev_ans = $<
+
+    if ("$rev_ans" == "y") then
         echo "🔄 Reverting all opened files..."
         p4 revert //...
         echo "✅ All opened files reverted."
     else
         echo "❌ Revert skipped. Exiting to avoid unsafe sync."
-        return 1
-    fi
+        return
+    endif
 else
     echo "✅ No opened or unshelved files."
-fi
+endif
 
 # ------------------------------------
 # 2. Check if latest sync is available
 # ------------------------------------
 echo "🔍 Checking for latest updates..."
-p4 sync -n > /tmp/p4_sync_preview.txt
+set SYNC_PREVIEW = "`p4 sync -n 2>/dev/null`"
 
-if [ -s /tmp/p4_sync_preview.txt ]; then
+if ("$SYNC_PREVIEW" != "") then
     echo "⚠️ New updates are available."
-    read -p "Do you want to sync with latest? (y/n): " sync_ans
+    echo -n "Do you want to sync with latest? (y/n): "
+    set sync_ans = $<
 else
     echo "✅ Workspace already up to date."
-    sync_ans="n"
-fi
+    set sync_ans = "n"
+endif
 
 # ------------------------------------
 # 3. Sync ONLY if user agrees
 # ------------------------------------
-if [[ "$sync_ans" == "y" ]]; then
+if ("$sync_ans" == "y") then
     echo "🔄 Syncing to latest..."
     p4 sync
     echo "✅ Sync completed."
 else
     echo "⏭️ Sync skipped by user."
-    return 0
-fi
+    return
+endif
 
 echo "========================================"
