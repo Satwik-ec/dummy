@@ -1,0 +1,53 @@
+#!/bin/bash
+
+echo "========== P4 Safe Sync Script =========="
+
+# ------------------------------------
+# 1. Check for opened / unshelved files
+# ------------------------------------
+OPENED=$(p4 opened 2>/dev/null)
+
+if [ -n "$OPENED" ]; then
+    echo "⚠️ Opened / unshelved files detected:"
+    echo "$OPENED"
+
+    read -p "Do you want to revert ALL opened files? (y/n): " rev_ans
+    if [[ "$rev_ans" == "y" ]]; then
+        echo "🔄 Reverting all opened files..."
+        p4 revert //...
+        echo "✅ All opened files reverted."
+    else
+        echo "❌ Revert skipped. Exiting to avoid unsafe sync."
+        return 1
+    fi
+else
+    echo "✅ No opened or unshelved files."
+fi
+
+# ------------------------------------
+# 2. Check if latest sync is available
+# ------------------------------------
+echo "🔍 Checking for latest updates..."
+p4 sync -n > /tmp/p4_sync_preview.txt
+
+if [ -s /tmp/p4_sync_preview.txt ]; then
+    echo "⚠️ New updates are available."
+    read -p "Do you want to sync with latest? (y/n): " sync_ans
+else
+    echo "✅ Workspace already up to date."
+    sync_ans="n"
+fi
+
+# ------------------------------------
+# 3. Sync ONLY if user agrees
+# ------------------------------------
+if [[ "$sync_ans" == "y" ]]; then
+    echo "🔄 Syncing to latest..."
+    p4 sync
+    echo "✅ Sync completed."
+else
+    echo "⏭️ Sync skipped by user."
+    return 0
+fi
+
+echo "========================================"
