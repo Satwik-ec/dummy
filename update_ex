@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 PCIe Regression Summary -> Excel (formatted like screenshot)
 
@@ -29,15 +28,19 @@ cfgX        |VDUT | Compilation Status : PASS/FAIL ...
            |     | Run Results : ...
 
 Usage:
-  python3 regress_summary_excel_uio_py34.py /path/to/regression
-  python3 regress_summary_excel_uio_py34.py /path/to/regression -o /path/to/out.xlsx
-  python3 regress_summary_excel_uio_py34.py /path/to/regression --no-per-test
+  python3 regress_summary_excel_uio.py /path/to/regression
+  python3 regress_summary_excel_uio.py /path/to/regression -o /path/to/out.xlsx
+  python3 regress_summary_excel_uio.py /path/to/regression --no-per-test
 """
+
+from __future__ import annotations
 
 import argparse
 import datetime as dt
 import re
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 # ---------- Parsing patterns ----------
 DB_OK_STR = "database successfully generated"
@@ -53,27 +56,26 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
 
-# --------- Simple containers (avoid dataclasses) ----------
-class CompileResult(object):
-    def __init__(self, lp, status, log_path, errors, chosen_dir):
-        self.lp = lp                  # "VDUT" or "VIP"
-        self.status = status          # "PASS" / "FAIL" / "NA"
-        self.log_path = log_path      # pathlib.Path or None
-        self.errors = errors or []    # list of strings
-        self.chosen_dir = chosen_dir  # str or None
+@dataclass
+class CompileResult:
+    lp: str                 # "VDUT" or "VIP"
+    status: str             # "PASS" / "FAIL" / "NA"
+    log_path: Optional[Path]
+    errors: List[str]
+    chosen_dir: Optional[str]
 
 
-class TestResult(object):
-    def __init__(self, test_dir, status, uvm_error_count, uvm_fatal_count, log_path):
-        self.test_dir = test_dir
-        self.status = status          # PASS/FAIL
-        self.uvm_error_count = uvm_error_count
-        self.uvm_fatal_count = uvm_fatal_count
-        self.log_path = log_path      # pathlib.Path or None
+@dataclass
+class TestResult:
+    test_dir: str
+    status: str             # PASS/FAIL
+    uvm_error_count: int
+    uvm_fatal_count: int
+    log_path: Optional[Path]
 
 
 # ----------------- Helpers: file/log parsing -----------------
-def safe_read_lines(log_path, max_bytes=10 * 1000 * 1000):
+def safe_read_lines(log_path: Path, max_bytes: int = 10_000_000) -> List[str]:
     """Read log file safely with max size cap."""
     try:
         with log_path.open("rb") as f:
@@ -81,25 +83,25 @@ def safe_read_lines(log_path, max_bytes=10 * 1000 * 1000):
         if len(data) > max_bytes:
             data = data[:max_bytes]
         return data.decode(errors="replace").splitlines()
-    except (IOError, OSError):
+    except (FileNotFoundError, OSError):
         return []
 
 
-def second_last_nonempty_line_contains(lines, needle):
+def second_last_nonempty_line_contains(lines: List[str], needle: str) -> bool:
     """Return True if the second-last non-empty line contains needle."""
     trimmed = [l for l in lines if l.strip()]
     if not trimmed:
         return False
     if len(trimmed) < 2:
-        return (needle in trimmed[-1])
-    return (needle in trimmed[-2])
+        return needle in trimmed[-1]
+    return needle in trimmed[-2]
 
 
-def extract_compile_errors(lines, max_lines=30):
+def extract_compile_errors(lines: List[str], max_lines: int = 30) -> List[str]:
     """Extract unique error lines matching Error-[ pattern."""
     errs = [l.strip() for l in lines if ERR_PATTERN.search(l)]
     seen = set()
-    uniq = []
+    uniq: List[str] = []
     for e in errs:
         if e not in seen:
             uniq.append(e)
@@ -109,7 +111,7 @@ def extract_compile_errors(lines, max_lines=30):
     return uniq
 
 
-def count_uvm(lines):
+def count_uvm(lines: List[str]) -> Tuple[int, int]:
     """Count UVM_ERROR and UVM_FATAL occurrences."""
     err_cnt = sum(1 for l in lines if UVM_ERR_PATTERN.search(l))
     fatal_cnt = sum(1 for l in lines if UVM_FATAL_PATTERN.search(l))
@@ -117,7 +119,7 @@ def count_uvm(lines):
 
 
 # ----------------- Discover regression structure -----------------
-def discover_configs(reg_root):
+def discover_configs(reg_root: Path) -> List[Path]:
     """
     Config dirs:
       - immediate subdirs under regression root
@@ -126,29 +128,21 @@ def discover_configs(reg_root):
     """
     if not reg_root.is_dir():
         return []
-    configs = []
+    configs: List[Path] = []
     for p in reg_root.iterdir():
-        try:
-            if p.is_dir() and ("uio" in p.name.lower()) and (p / "sim").is_dir():
-                configs.append(p)
-        except OSError:
-            # in case of permission or transient FS error
-            continue
+        if p.is_dir() and ("uio" in p.name.lower()) and (p / "sim").is_dir():
+            configs.append(p)
     return sorted(configs, key=lambda x: x.name)
 
 
-def find_compile_dirs(sim_dir):
+def find_compile_dirs(sim_dir: Path) -> List[Path]:
     """Compile directories always start with compile_dw_."""
     if not sim_dir.is_dir():
         return []
-    out = []
-    for p in sim_dir.iterdir():
-        if p.is_dir() and p.name.startswith("compile_dw_"):
-            out.append(p)
-    return out
+    return [p for p in sim_dir.iterdir() if p.is_dir() and p.name.startswith("compile_dw_")]
 
 
-def classify_lp_from_dirname(name):
+def classify_lp_from_dirname(name: str) -> Optional[str]:
     n = name.lower()
     if "vdut" in n:
         return "VDUT"
@@ -157,11 +151,11 @@ def classify_lp_from_dirname(name):
     return None
 
 
-def pick_newest(paths):
+def pick_newest(paths: List[Path]) -> Optional[Path]:
     return max(paths, key=lambda p: p.stat().st_mtime) if paths else None
 
 
-def compile_status_for_lp(sim_dir, lp):
+def compile_status_for_lp(sim_dir: Path, lp: str) -> CompileResult:
     """
     For a given LP (VDUT/VIP), pick newest compile_dw_* dir that matches LP substring,
     and decide PASS/FAIL by test.log.
@@ -178,16 +172,16 @@ def compile_status_for_lp(sim_dir, lp):
 
     if second_last_nonempty_line_contains(lines, DB_OK_STR):
         return CompileResult(lp=lp, status="PASS",
-                             log_path=(log_path if log_path.exists() else None),
+                             log_path=log_path if log_path.exists() else None,
                              errors=[], chosen_dir=chosen.name)
 
     errs = extract_compile_errors(lines)
     return CompileResult(lp=lp, status="FAIL",
-                         log_path=(log_path if log_path.exists() else None),
+                         log_path=log_path if log_path.exists() else None,
                          errors=errs, chosen_dir=chosen.name)
 
 
-def find_test_dirs(sim_dir):
+def find_test_dirs(sim_dir: Path) -> List[Path]:
     """
     Test directories:
       - under sim/
@@ -196,7 +190,7 @@ def find_test_dirs(sim_dir):
     """
     if not sim_dir.is_dir():
         return []
-    out = []
+    out: List[Path] = []
     for p in sim_dir.iterdir():
         if not p.is_dir():
             continue
@@ -208,8 +202,8 @@ def find_test_dirs(sim_dir):
     return sorted(out, key=lambda x: x.name)
 
 
-def parse_test_results(sim_dir):
-    results = []
+def parse_test_results(sim_dir: Path) -> List[TestResult]:
+    results: List[TestResult] = []
     for tdir in find_test_dirs(sim_dir):
         log_path = tdir / "test.log"
         lines = safe_read_lines(log_path)
@@ -220,17 +214,23 @@ def parse_test_results(sim_dir):
             status=status,
             uvm_error_count=uerr,
             uvm_fatal_count=ufat,
-            log_path=(log_path if log_path.exists() else None),
+            log_path=log_path if log_path.exists() else None,
         ))
     return results
 
 
-def is_config_compile_clean(vdut, vip):
+def is_config_compile_clean(vdut: CompileResult, vip: CompileResult) -> bool:
     return vdut.status == "PASS" and vip.status == "PASS"
 
 
 # ----------------- Excel Writer (matches your screenshot layout) -----------------
-def make_excel_report(out_path, reg_root, configs_data, today, include_per_test):
+def make_excel_report(
+    out_path: Path,
+    reg_root: Path,
+    configs_data: Dict[str, Dict],
+    today: str,
+    include_per_test: bool,
+) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "Summary"
@@ -247,7 +247,7 @@ def make_excel_report(out_path, reg_root, configs_data, today, include_per_test)
     fail_fill = PatternFill("solid", fgColor="FFC7CE")  # light red
     na_fill = PatternFill("solid", fgColor="E7E6E6")    # light grey
 
-    def fill_for_status(s):
+    def fill_for_status(s: str) -> PatternFill:
         s_up = (s or "").upper()
         if "PASS" in s_up:
             return pass_fill
@@ -264,6 +264,9 @@ def make_excel_report(out_path, reg_root, configs_data, today, include_per_test)
         cell.alignment = center
         cell.border = border
 
+    # Optional: top meta info (commented out; enable if you want)
+    # ws.insert_rows(1, amount=2)  # would shift header; keeping simple per your screenshot
+
     row = 2
 
     # Write each config block
@@ -273,20 +276,21 @@ def make_excel_report(out_path, reg_root, configs_data, today, include_per_test)
         for lp in ["VDUT", "VIP"]:
             lp_block_start = row
 
-            comp = configs_data[cfg_name]["compile"][lp]
-            run_summary = configs_data[cfg_name]["run"][lp]["summary"]
-            per_test_lines = configs_data[cfg_name]["run"][lp]["per_test"]
+            comp: CompileResult = configs_data[cfg_name]["compile"][lp]
+            run_summary: str = configs_data[cfg_name]["run"][lp]["summary"]
+            per_test_lines: List[str] = configs_data[cfg_name]["run"][lp]["per_test"]
 
             # Row 1: Compilation Status
-            comp_text = "Compilation Status : {0}".format(comp.status)
+            comp_text = f"Compilation Status : {comp.status}"
             extras = []
             if comp.chosen_dir:
-                extras.append("dir={0}".format(comp.chosen_dir))
+                extras.append(f"dir={comp.chosen_dir}")
             if comp.log_path:
-                extras.append("log={0}".format(comp.log_path))
+                extras.append(f"log={comp.log_path}")
             if extras:
                 comp_text += "  (" + ", ".join(extras) + ")"
 
+            # If FAIL, append first few errors
             if comp.status == "FAIL" and comp.errors:
                 comp_text += "\nErrors: " + "; ".join(comp.errors[:5])
                 if len(comp.errors) > 5:
@@ -297,15 +301,17 @@ def make_excel_report(out_path, reg_root, configs_data, today, include_per_test)
             row += 1
 
             # Row 2: Run Results
-            run_text = "Run Results : {0}".format(run_summary)
+            run_text = f"Run Results : {run_summary}"
             ws.append(["", "", run_text, today])
+            # If run summary implies FAIL/PASS, color it accordingly
             ws.cell(row=row, column=3).fill = fill_for_status(run_summary)
             row += 1
 
-            # Optional per-test rows
+            # Optional per-test rows (indented in status column)
             if include_per_test and per_test_lines:
                 for line in per_test_lines:
                     ws.append(["", "", "  " + line, today])
+                    # If line includes FAIL/PASS, color lightly
                     ws.cell(row=row, column=3).fill = fill_for_status(line)
                     row += 1
 
@@ -315,7 +321,7 @@ def make_excel_report(out_path, reg_root, configs_data, today, include_per_test)
         # Merge CONFIG NAME column for full config block
         ws.merge_cells(start_row=cfg_block_start, start_column=1, end_row=row - 1, end_column=1)
 
-        # Blank separator
+        # Add a blank separator row between configs (like visual spacing)
         ws.append(["", "", "", ""])
         row += 1
 
@@ -332,7 +338,7 @@ def make_excel_report(out_path, reg_root, configs_data, today, include_per_test)
             else:
                 cell.alignment = left
 
-    # Column widths similar to screenshot
+    # Column widths similar to your screenshot
     ws.column_dimensions["A"].width = 25
     ws.column_dimensions["B"].width = 10
     ws.column_dimensions["C"].width = 80
@@ -343,7 +349,7 @@ def make_excel_report(out_path, reg_root, configs_data, today, include_per_test)
 
 
 # ----------------- Main orchestrator -----------------
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description="Generate formatted Excel summary for regression configs containing 'uio'.")
     ap.add_argument("regression_path", help="Regression root directory path")
     ap.add_argument(
@@ -365,11 +371,12 @@ def main():
     configs = discover_configs(reg_root)
     if not configs:
         raise SystemExit(
-            "No config dirs found under {0}.\nExpected: subdirs whose name contains 'uio' and which have a 'sim/' directory.".format(reg_root)
+            f"No config dirs found under {reg_root}.\n"
+            f"Expected: subdirs whose name contains 'uio' and which have a 'sim/' directory."
         )
 
     # Build data model for Excel writer
-    configs_data = {}
+    configs_data: Dict[str, Dict] = {}
 
     for cfg_dir in configs:
         cfg_name = cfg_dir.name
@@ -392,15 +399,14 @@ def main():
             passed = sum(1 for t in tests if t.status == "PASS")
             failed = sum(1 for t in tests if t.status == "FAIL")
 
-            summary = "TOTAL={0} PASS={1} FAIL={2}".format(total, passed, failed)
+            # Run summary applies at config-level; we show it under both VDUT and VIP to match your table template
+            summary = f"TOTAL={total} PASS={passed} FAIL={failed}"
             per_test_lines = []
             for t in tests:
-                line = "{td} => {st} (UVM_ERROR={ue}, UVM_FATAL={uf})".format(
-                    td=t.test_dir, st=t.status, ue=t.uvm_error_count, uf=t.uvm_fatal_count
+                per_test_lines.append(
+                    f"{t.test_dir} => {t.status} (UVM_ERROR={t.uvm_error_count}, UVM_FATAL={t.uvm_fatal_count})"
+                    + (f" | log={t.log_path}" if t.log_path else "")
                 )
-                if t.log_path:
-                    line += " | log={0}".format(t.log_path)
-                per_test_lines.append(line)
 
             run_data["VDUT"]["summary"] = summary
             run_data["VIP"]["summary"] = summary
@@ -420,8 +426,8 @@ def main():
         include_per_test=(not args.no_per_test),
     )
 
-    print("Excel report generated: {0}".format(out_path))
-    print("Configs detected (contain 'uio'): {0}".format(len(configs)))
+    print(f"Excel report generated: {out_path}")
+    print(f"Configs detected (contain 'uio'): {len(configs)}")
 
 
 if __name__ == "__main__":
