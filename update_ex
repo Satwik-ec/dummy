@@ -209,3 +209,220 @@ def find_test_dirs(sim_dir):
 
 
 def parse_test_results(sim_dir):
+    results = []
+    for tdir in find_test_dirs(sim_dir):
+        log_path = tdir / "test.log"
+        lines = safe_read_lines(log_path)
+        uerr, ufat = count_uvm(lines)
+        status = "PASS" if (uerr == 0 and ufat == 0) else "FAIL"
+        results.append(TestResult(
+            test_dir=tdir.name,
+            status=status,
+            uvm_error_count=uerr,
+            uvm_fatal_count=ufat,
+            log_path=(log_path if log_path.exists() else None),
+        ))
+    return results
+
+
+def is_config_compile_clean(vdut, vip):
+    return vdut.status == "PASS" and vip.status == "PASS"
+
+
+# ----------------- Excel Writer (matches your screenshot layout) -----------------
+def make_excel_report(out_path, reg_root, configs_data, today, include_per_test):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Summary"
+
+    # Styles
+    header_font = Font(bold=True)
+    center = Alignment(vertical="center", horizontal="center", wrap_text=True)
+    left = Alignment(vertical="center", horizontal="left", wrap_text=True)
+
+    thin = Side(style="thin")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    pass_fill = PatternFill("solid", fgColor="C6EFCE")  # light green
+    fail_fill = PatternFill("solid", fgColor="FFC7CE")  # light red
+    na_fill = PatternFill("solid", fgColor="E7E6E6")    # light grey
+
+    def fill_for_status(s):
+        s_up = (s or "").upper()
+        if "PASS" in s_up:
+            return pass_fill
+        if "FAIL" in s_up:
+            return fail_fill
+        return na_fill
+
+    # Header row
+    headers = ["CONFIG NAME", "LP", "Compilation /Run status", "Todays Date"]
+    ws.append(headers)
+    for c in range(1, 5):
+        cell = ws.cell(row=1, column=c)
+        cell.font = header_font
+        cell.alignment = center
+        cell.border = border
+
+    row = 2
+
+    # Write each config block
+    for cfg_name in sorted(configs_data.keys()):
+        cfg_block_start = row
+
+        for lp in ["VDUT", "VIP"]:
+            lp_block_start = row
+
+            comp = configs_data[cfg_name]["compile"][lp]
+            run_summary = configs_data[cfg_name]["run"][lp]["summary"]
+            per_test_lines = configs_data[cfg_name]["run"][lp]["per_test"]
+
+            # Row 1: Compilation Status
+            comp_text = "Compilation Status : {0}".format(comp.status)
+            extras = []
+            if comp.chosen_dir:
+                extras.append("dir={0}".format(comp.chosen_dir))
+            if comp.log_path:
+                extras.append("log={0}".format(comp.log_path))
+            if extras:
+                comp_text += "  (" + ", ".join(extras) + ")"
+
+            if comp.status == "FAIL" and comp.errors:
+                comp_text += "\nErrors: " + "; ".join(comp.errors[:5])
+                if len(comp.errors) > 5:
+                    comp_text += " ..."
+
+            ws.append([cfg_name, lp, comp_text, today])
+            ws.cell(row=row, column=3).fill = fill_for_status(comp.status)
+            row += 1
+
+            # Row 2: Run Results
+            run_text = "Run Results : {0}".format(run_summary)
+            ws.append(["", "", run_text, today])
+            ws.cell(row=row, column=3).fill = fill_for_status(run_summary)
+            row += 1
+
+            # Optional per-test rows
+            if include_per_test and per_test_lines:
+                for line in per_test_lines:
+                    ws.append(["", "", "  " + line, today])
+                    ws.cell(row=row, column=3).fill = fill_for_status(line)
+                    row += 1
+
+            # Merge LP column for that LP block
+            ws.merge_cells(start_row=lp_block_start, start_column=2, end_row=row - 1, end_column=2)
+
+        # Merge CONFIG NAME column for full config block
+        ws.merge_cells(start_row=cfg_block_start, start_column=1, end_row=row - 1, end_column=1)
+
+        # Blank separator
+        ws.append(["", "", "", ""])
+        row += 1
+
+    # Apply borders + alignment
+    max_row = ws.max_row
+    for r in range(1, max_row + 1):
+        for c in range(1, 5):
+            cell = ws.cell(row=r, column=c)
+            cell.border = border
+            if r == 1:
+                continue
+            if c in (1, 2, 4):
+                cell.alignment = center
+            else:
+                cell.alignment = left
+
+    # Column widths similar to screenshot
+    ws.column_dimensions["A"].width = 25
+    ws.column_dimensions["B"].width = 10
+    ws.column_dimensions["C"].width = 80
+    ws.column_dimensions["D"].width = 14
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
+
+
+# ----------------- Main orchestrator -----------------
+def main():
+    ap = argparse.ArgumentParser(description="Generate formatted Excel summary for regression configs containing 'uio'.")
+    ap.add_argument("regression_path", help="Regression root directory path")
+    ap.add_argument(
+        "-o", "--out",
+        default=None,
+        help="Output Excel file path (default: <regression_path>/regression_summary.xlsx)"
+    )
+    ap.add_argument(
+        "--no-per-test",
+        action="store_true",
+        help="Do not include per-test breakdown lines in Excel; only show totals."
+    )
+    args = ap.parse_args()
+
+    reg_root = Path(args.regression_path).resolve()
+    out_path = Path(args.out).resolve() if args.out else (reg_root / "regression_summary.xlsx")
+    today = dt.date.today().isoformat()
+
+    configs = discover_configs(reg_root)
+    if not configs:
+        raise SystemExit(
+            "No config dirs found under {0}.\nExpected: subdirs whose name contains 'uio' and which have a 'sim/' directory.".format(reg_root)
+        )
+
+    # Build data model for Excel writer
+    configs_data = {}
+
+    for cfg_dir in configs:
+        cfg_name = cfg_dir.name
+        sim_dir = cfg_dir / "sim"
+
+        vdut_comp = compile_status_for_lp(sim_dir, "VDUT")
+        vip_comp = compile_status_for_lp(sim_dir, "VIP")
+
+        compile_clean = is_config_compile_clean(vdut_comp, vip_comp)
+
+        run_data = {
+            "VDUT": {"summary": "SKIPPED (compile not clean)", "per_test": []},
+            "VIP":  {"summary": "SKIPPED (compile not clean)", "per_test": []},
+        }
+
+        if compile_clean:
+            tests = parse_test_results(sim_dir)
+
+            total = len(tests)
+            passed = sum(1 for t in tests if t.status == "PASS")
+            failed = sum(1 for t in tests if t.status == "FAIL")
+
+            summary = "TOTAL={0} PASS={1} FAIL={2}".format(total, passed, failed)
+            per_test_lines = []
+            for t in tests:
+                line = "{td} => {st} (UVM_ERROR={ue}, UVM_FATAL={uf})".format(
+                    td=t.test_dir, st=t.status, ue=t.uvm_error_count, uf=t.uvm_fatal_count
+                )
+                if t.log_path:
+                    line += " | log={0}".format(t.log_path)
+                per_test_lines.append(line)
+
+            run_data["VDUT"]["summary"] = summary
+            run_data["VIP"]["summary"] = summary
+            run_data["VDUT"]["per_test"] = per_test_lines
+            run_data["VIP"]["per_test"] = per_test_lines
+
+        configs_data[cfg_name] = {
+            "compile": {"VDUT": vdut_comp, "VIP": vip_comp},
+            "run": run_data,
+        }
+
+    make_excel_report(
+        out_path=out_path,
+        reg_root=reg_root,
+        configs_data=configs_data,
+        today=today,
+        include_per_test=(not args.no_per_test),
+    )
+
+    print("Excel report generated: {0}".format(out_path))
+    print("Configs detected (contain 'uio'): {0}".format(len(configs)))
+
+
+if __name__ == "__main__":
+    main()
