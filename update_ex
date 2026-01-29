@@ -14,6 +14,7 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
 # ---------- Parsing patterns ----------
 DB_OK_STR = "database successfully generated"
+SVA_ERR_PATTERN = re.compile(r"\bSNPS SVA checker: ERROR\b")
 ERR_PATTERN = re.compile(r"Error-\[", re.IGNORECASE)  # '[' must be escaped
 UVM_ERR_PATTERN = re.compile(r"\bUVM_ERROR\b")
 UVM_FATAL_PATTERN = re.compile(r"\bUVM_FATAL\b")
@@ -58,7 +59,11 @@ def second_last_nonempty_line_contains(lines: List[str], needle: str) -> bool:
 
 
 def extract_compile_errors(lines: List[str], max_lines: int = 30) -> List[str]:
-    errs = [l.strip() for l in lines if ERR_PATTERN.search(l)]
+    errs = []
+    for l in lines:
+        if ERR_PATTERN.search(l) or SVA_ERR_PATTERN.search(l):
+            errs.append(l.strip())
+
     seen = set()
     uniq: List[str] = []
     for e in errs:
@@ -68,6 +73,7 @@ def extract_compile_errors(lines: List[str], max_lines: int = 30) -> List[str]:
         if len(uniq) >= max_lines:
             break
     return uniq
+
 
 
 def extract_uvm_messages(lines: List[str], max_lines: int = 50) -> List[str]:
