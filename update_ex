@@ -1,38 +1,4 @@
 #!/usr/bin/env python3
-"""
-PCIe Regression Summary -> Excel (formatted like screenshot)
-
-Detection rules (as per your latest requirements):
-- Config directory can be anything, but config dir name contains 'uio' (case-insensitive)
-- Config dir must have <config>/sim/
-- Under <config>/sim/:
-  - compile directories begin with 'compile_dw_'
-    - VDUT compile dir contains 'vdut' in dir name
-    - VIP  compile dir contains 'vip'  in dir name
-    - compile result: <compile_dir>/test.log
-        PASS if second-last non-empty line contains: "database successfully generated"
-        FAIL otherwise; extract errors by matching "Error-["
-  - if BOTH VDUT and VIP compile PASS => run starts
-  - test directories:
-      - not starting with 'compile_dw_'
-      - name contains 'vtb' (case-insensitive)
-      - each has test.log
-      - FAIL if log contains UVM_ERROR or UVM_FATAL (counted); else PASS
-
-Excel output layout (matches screenshot):
-CONFIG NAME | LP  | Compilation/Run status | Todays Date
--------------------------------------------------------
-cfgX        |VDUT | Compilation Status : PASS/FAIL ...
-           |     | Run Results : TOTAL=.. PASS=.. FAIL=.. (and optionally per-test)
-           |VIP  | Compilation Status : ...
-           |     | Run Results : ...
-
-Usage:
-  python3 regress_summary_excel_uio.py /path/to/regression
-  python3 regress_summary_excel_uio.py /path/to/regression -o /path/to/out.xlsx
-  python3 regress_summary_excel_uio.py /path/to/regression --no-per-test
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -48,10 +14,7 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
 # ---------- Parsing patterns ----------
 DB_OK_STR = "database successfully generated"
-
-# IMPORTANT: '[' must be escaped
-ERR_PATTERN = re.compile(r"Error-\[", re.IGNORECASE)
-
+ERR_PATTERN = re.compile(r"Error-\[", re.IGNORECASE)  # '[' must be escaped
 UVM_ERR_PATTERN = re.compile(r"\bUVM_ERROR\b")
 UVM_FATAL_PATTERN = re.compile(r"\bUVM_FATAL\b")
 
@@ -68,10 +31,8 @@ class CompileResult:
 @dataclass
 class TestResult:
     test_dir: str
-    status: str              # PASS/FAIL
-    uvm_error_count: int
-    uvm_fatal_count: int
-    uvm_messages: List[str]  # actual lines
+    status: str              # PASS/FAIL/RUNNING/UNKNOWN
+    uvm_messages: List[str]  # actual lines (only meaningful when completed/failed)
     log_path: Optional[Path]
 
 
@@ -109,16 +70,7 @@ def extract_compile_errors(lines: List[str], max_lines: int = 30) -> List[str]:
     return uniq
 
 
-def count_uvm(lines: List[str]) -> Tuple[int, int]:
-    err_cnt = sum(1 for l in lines if UVM_ERR_PATTERN.search(l))
-    fatal_cnt = sum(1 for l in lines if UVM_FATAL_PATTERN.search(l))
-    return err_cnt, fatal_cnt
-
-
 def extract_uvm_messages(lines: List[str], max_lines: int = 50) -> List[str]:
-    """
-    Extract actual UVM_ERROR / UVM_FATAL lines (limited to keep Excel readable).
-    """
     msgs: List[str] = []
     for line in lines:
         if "UVM_ERROR" in line or "UVM_FATAL" in line:
@@ -207,19 +159,41 @@ def find_test_dirs(sim_dir: Path) -> List[Path]:
     return sorted(out, key=lambda x: x.name)
 
 
+def get_test_state_from_markers(test_dir: Path) -> str:
+    """
+    Your rule:
+      - if passed exists => PASS
+      - if failed exists => FAIL
+      - else if compile_passed exists => RUNNING
+      - else => UNKNOWN
+    """
+    if (test_dir / "passed").exists():
+        return "PASS"
+    if (test_dir / "failed").exists():
+        return "FAIL"
+    if (test_dir / "compile_passed").exists():
+        return "RUNNING"
+    return "UNKNOWN"
+
+
 def parse_test_results(sim_dir: Path) -> List[TestResult]:
     results: List[TestResult] = []
     for tdir in find_test_dirs(sim_dir):
+        state = get_test_state_from_markers(tdir)
         log_path = tdir / "test.log"
-        lines = safe_read_lines(log_path)
-        uerr, ufat = count_uvm(lines)
-        msgs = extract_uvm_messages(lines)
-        status = "PASS" if (uerr == 0 and ufat == 0) else "FAIL"
+
+        # Only extract UVM lines when:
+        # - FAIL (most useful)
+        # - or PASS (optional, but typically none)
+        # For RUNNING/UNKNOWN we avoid misclassifying.
+        msgs: List[str] = []
+        if state in ("FAIL", "PASS") and log_path.exists():
+            lines = safe_read_lines(log_path)
+            msgs = extract_uvm_messages(lines)
+
         results.append(TestResult(
             test_dir=tdir.name,
-            status=status,
-            uvm_error_count=uerr,
-            uvm_fatal_count=ufat,
+            status=state,
             uvm_messages=msgs,
             log_path=log_path if log_path.exists() else None,
         ))
@@ -232,14 +206,6 @@ def is_config_compile_clean(vdut: CompileResult, vip: CompileResult) -> bool:
 
 # ----------------- Cell builders (Todays Date cell contains date + details) -----------------
 def build_compilation_cell(today: str, comp: CompileResult) -> str:
-    """
-    Single cell content:
-      <date>
-      Compilation: PASS/FAIL/NA
-      Info: dir=..., log=...
-      Errors:
-        1) Error-[...]
-    """
     lines: List[str] = [today, f"Compilation: {comp.status}"]
 
     info = []
@@ -257,52 +223,69 @@ def build_compilation_cell(today: str, comp: CompileResult) -> str:
                 lines.append(f"  {i}) {e}")
         else:
             lines.append("Errors: (no Error-[ lines found)")
-
     return "\n".join(lines)
 
 
-def build_run_cell(today: str, run_summary: str, tests: List[TestResult]) -> str:
+def build_run_cell(today: str, tests: List[TestResult], compile_clean: bool) -> str:
     """
     Single cell content:
       <date>
-      Run Summary: TOTAL=.. PASS=.. FAIL=..
+      Run Summary: TOTAL=.. PASS=.. FAIL=.. RUNNING=.. UNKNOWN=..
       Failures:
         1) test_xxx
             1. UVM_ERROR ...
-            2. UVM_FATAL ...
+      Running:
+        1) test_yyy
     """
-    lines: List[str] = [today, f"Run Summary: {run_summary}"]
+    if not compile_clean:
+        return "\n".join([today, "Run Summary: SKIPPED (compile not clean)"])
 
-    if run_summary.startswith("SKIPPED") or run_summary.startswith("NA"):
-        return "\n".join(lines)
+    total = len(tests)
+    pass_cnt = sum(1 for t in tests if t.status == "PASS")
+    fail_cnt = sum(1 for t in tests if t.status == "FAIL")
+    run_cnt = sum(1 for t in tests if t.status == "RUNNING")
+    unk_cnt = sum(1 for t in tests if t.status == "UNKNOWN")
 
+    lines: List[str] = [
+        today,
+        f"Run Summary: TOTAL={total} PASS={pass_cnt} FAIL={fail_cnt} RUNNING={run_cnt} UNKNOWN={unk_cnt}"
+    ]
+
+    # Failures details with numbered UVM lines
     failing = [t for t in tests if t.status == "FAIL"]
-    if not failing:
-        return "\n".join(lines)
+    if failing:
+        lines.append("Failures:")
+        for i, t in enumerate(failing, start=1):
+            lines.append(f"{i}) {t.test_dir} (log={t.log_path if t.log_path else 'NA'})")
+            if t.uvm_messages:
+                for j, msg in enumerate(t.uvm_messages, start=1):
+                    lines.append(f"    {j}. {msg}")
+            else:
+                lines.append("    1. (No UVM_ERROR/UVM_FATAL lines found)")
 
-    lines.append("Failures:")
-    fail_idx = 1
-    for t in failing:
-        lines.append(f"{fail_idx}) {t.test_dir} (log={t.log_path if t.log_path else 'NA'})")
-        if t.uvm_messages:
-            msg_idx = 1
-            for msg in t.uvm_messages:
-                lines.append(f"    {msg_idx}. {msg}")
-                msg_idx += 1
-        else:
-            lines.append("    1. (No UVM_ERROR/UVM_FATAL lines found)")
-        fail_idx += 1
+    # Running tests list
+    running = [t for t in tests if t.status == "RUNNING"]
+    if running:
+        lines.append("Running:")
+        for i, t in enumerate(running, start=1):
+            lines.append(f"{i}) {t.test_dir}")
+
+    # Unknown tests list
+    unknown = [t for t in tests if t.status == "UNKNOWN"]
+    if unknown:
+        lines.append("Unknown:")
+        for i, t in enumerate(unknown, start=1):
+            lines.append(f"{i}) {t.test_dir}")
 
     return "\n".join(lines)
 
 
-# ----------------- Excel writer (your requested format) -----------------
-def write_excel(out_path: Path, configs_data: Dict[str, Dict], today: str) -> None:
+# ----------------- Excel writer -----------------
+def write_excel(out_path: Path, configs_data: Dict[str, Dict]) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "Summary"
 
-    # Styles
     header_font = Font(bold=True)
     center = Alignment(vertical="center", horizontal="center", wrap_text=True)
     left_top = Alignment(vertical="top", horizontal="left", wrap_text=True)
@@ -313,22 +296,24 @@ def write_excel(out_path: Path, configs_data: Dict[str, Dict], today: str) -> No
     pass_fill = PatternFill("solid", fgColor="C6EFCE")
     fail_fill = PatternFill("solid", fgColor="FFC7CE")
     na_fill = PatternFill("solid", fgColor="E7E6E6")
+    run_fill = PatternFill("solid", fgColor="FFF2CC")  # light yellow for RUNNING
 
     def fill_for_cell_text(cell_text: str) -> PatternFill:
         t = (cell_text or "").upper()
-        if "COMPILATION: PASS" in t:
-            return pass_fill
         if "COMPILATION: FAIL" in t:
             return fail_fill
-        if "RUN SUMMARY: TOTAL=" in t and " FAIL=0" in t:
+        if "RUN SUMMARY:" in t and " FAIL=0" in t and "RUNNING=0" in t and "UNKNOWN=0" in t:
             return pass_fill
         if "FAILURES:" in t:
             return fail_fill
-        if "SKIPPED" in t or "NA" in t:
+        if "RUNNING=" in t and "RUNNING=0" not in t:
+            return run_fill
+        if "SKIPPED" in t or "UNKNOWN" in t or " NA" in t:
             return na_fill
+        if "COMPILATION: PASS" in t:
+            return pass_fill
         return na_fill
 
-    # Header row
     ws.append(["CONFIG NAME", "LP", "Status", "Todays Date"])
     for c in range(1, 5):
         cell = ws.cell(row=1, column=c)
@@ -337,48 +322,37 @@ def write_excel(out_path: Path, configs_data: Dict[str, Dict], today: str) -> No
         cell.border = border
 
     row = 2
-
     for cfg_name in sorted(configs_data.keys()):
         cfg_start = row
 
         for lp in ["VDUT", "VIP"]:
             lp_start = row
 
-            # Compilation row
             comp_text = configs_data[cfg_name]["comp_cells"][lp]
             ws.append([cfg_name, lp, "Compilation Status", comp_text])
             ws.cell(row=row, column=4).fill = fill_for_cell_text(comp_text)
             row += 1
 
-            # Run row
             run_text = configs_data[cfg_name]["run_cells"][lp]
             ws.append(["", "", "Run Results", run_text])
             ws.cell(row=row, column=4).fill = fill_for_cell_text(run_text)
             row += 1
 
-            # Merge LP across 2 rows
             ws.merge_cells(start_row=lp_start, start_column=2, end_row=row - 1, end_column=2)
 
-        # Merge CONFIG across 4 rows
         ws.merge_cells(start_row=cfg_start, start_column=1, end_row=row - 1, end_column=1)
 
-        # Optional blank separator
         ws.append(["", "", "", ""])
         row += 1
 
-    # Apply borders and alignment to all cells
     for r in range(1, ws.max_row + 1):
         for c in range(1, 5):
             cell = ws.cell(row=r, column=c)
             cell.border = border
             if r == 1:
                 continue
-            if c in (1, 2, 3):
-                cell.alignment = center
-            else:
-                cell.alignment = left_top
+            cell.alignment = center if c in (1, 2, 3) else left_top
 
-    # Column widths
     ws.column_dimensions["A"].width = 26
     ws.column_dimensions["B"].width = 10
     ws.column_dimensions["C"].width = 22
@@ -389,7 +363,7 @@ def write_excel(out_path: Path, configs_data: Dict[str, Dict], today: str) -> No
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Generate formatted Excel summary (date + details in same cell).")
+    ap = argparse.ArgumentParser(description="Generate Excel summary (detect RUNNING using marker files).")
     ap.add_argument("regression_path", help="Regression root directory path")
     ap.add_argument("-o", "--out", default=None,
                     help="Output Excel file path (default: <regression_path>/regression_summary.xlsx)")
@@ -413,30 +387,22 @@ def main() -> None:
 
         vdut_comp = compile_status_for_lp(sim_dir, "VDUT")
         vip_comp = compile_status_for_lp(sim_dir, "VIP")
+        clean = is_config_compile_clean(vdut_comp, vip_comp)
 
-        if is_config_compile_clean(vdut_comp, vip_comp):
-            tests = parse_test_results(sim_dir)
-            total = len(tests)
-            passed = sum(1 for t in tests if t.status == "PASS")
-            failed = sum(1 for t in tests if t.status == "FAIL")
-            run_summary = f"TOTAL={total} PASS={passed} FAIL={failed}"
-        else:
-            tests = []
-            run_summary = "SKIPPED (compile not clean)"
+        tests = parse_test_results(sim_dir) if clean else []
 
         comp_cells = {
             "VDUT": build_compilation_cell(today, vdut_comp),
             "VIP": build_compilation_cell(today, vip_comp),
         }
         run_cells = {
-            # show same run summary under both LP blocks (keeps 4-row template consistent)
-            "VDUT": build_run_cell(today, run_summary, tests),
-            "VIP": build_run_cell(today, run_summary, tests),
+            "VDUT": build_run_cell(today, tests, clean),
+            "VIP": build_run_cell(today, tests, clean),
         }
 
         configs_data[cfg_name] = {"comp_cells": comp_cells, "run_cells": run_cells}
 
-    write_excel(out_path, configs_data, today)
+    write_excel(out_path, configs_data)
     print(f"Excel report generated: {out_path}")
     print(f"Configs detected: {len(configs)}")
 
